@@ -11,6 +11,26 @@ export interface Completion {
   completed_date: string
 }
 
+export interface Routine {
+  id: string
+  user_id: string
+  name: string
+  days: number[]   // 0=Sun 1=Mon … 6=Sat
+  created_at: string
+  deleted_at: string | null
+}
+
+export interface RoutineCompletion {
+  routine_id: string
+  completed_date: string
+}
+
+export const DAY_LABELS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']
+
+export function getRoutinesForDay(routines: Routine[], dayOfWeek: number): Routine[] {
+  return routines.filter(r => !r.deleted_at && r.days.includes(dayOfWeek))
+}
+
 export function formatDate(date: Date): string {
   const y = date.getFullYear()
   const m = String(date.getMonth() + 1).padStart(2, '0')
