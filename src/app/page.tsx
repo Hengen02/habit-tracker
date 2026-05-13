@@ -75,18 +75,16 @@ export default function Home() {
           text-align: center; margin-top: 0.5rem;
         }
         .divider { height: 1px; background: #e5e1d8; margin: 1.75rem 0; }
-        .stats-row {
-          display: flex;
-          border: 1px solid #e0ddd5; border-radius: 14px;
-          overflow: hidden; margin-bottom: 1.75rem;
+        .quote-box {
+          background: #f0f4ee; border: 1px solid #c8d8c8;
+          border-radius: 14px; padding: 1rem 1.25rem;
+          margin-bottom: 1.75rem; text-align: center;
         }
-        .stat-box {
-          flex: 1; padding: 0.875rem 0.5rem; text-align: center;
-          background: #fff; border-right: 1px solid #e0ddd5;
+          
+        .quote-text {
+          font-family: 'Lora', serif; font-style: italic;
+          font-size: 0.95rem; color: #2d4a2d; line-height: 1.6;
         }
-        .stat-box:last-child { border-right: none; }
-        .stat-num { font-family: 'Lora', serif; font-size: 1.4rem; font-weight: 700; color: #2d4a2d; }
-        .stat-label { font-size: 0.65rem; color: #9c9688; margin-top: 2px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 500; }
         .input-label { display: block; font-size: 0.7rem; font-weight: 600; color: #9c9688; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.08em; }
         .input-wrap { position: relative; margin-bottom: 1rem; }
         .input-at { position: absolute; left: 1rem; top: 50%; transform: translateY(-50%); color: #b8b4aa; font-size: 1rem; pointer-events: none; transition: color 0.2s; }
@@ -118,10 +116,8 @@ export default function Home() {
         <h1 className="login-title">Streak Master</h1>
         <p className="login-sub">Build legendary habits. One day at a time.</p>
         <div className="divider" />
-        <div className="stats-row">
-          <div className="stat-box"><div className="stat-num">21</div><div className="stat-label">Avg days</div></div>
-          <div className="stat-box"><div className="stat-num">∞</div><div className="stat-label">Potential</div></div>
-          <div className="stat-box"><div className="stat-num">1</div><div className="stat-label">Start now</div></div>
+        <div className="quote-box">
+          <div className="quote-text">&ldquo;Login first, plan later.&rdquo;</div>
         </div>
         <form onSubmit={handleSubmit}>
           <label className="input-label">Your username</label>
