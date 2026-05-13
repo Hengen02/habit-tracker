@@ -285,7 +285,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
             <div className="week-row">
               {weekDays.map((day, i) => (
                 <div key={i} className={`week-dot-wrap ${i === todayDOWIdx ? 'week-today' : ''}`}>
-                  <div className={`week-dot ${day.hasHabits ? (day.completed ? 'week-dot-done' : 'week-dot-miss') : 'week-dot-empty'}`} />
+                  <div className={`week-dot ${day.status === 'complete' ? 'week-dot-done' : day.status === 'empty' ? 'week-dot-empty' : 'week-dot-miss'}`} />
                   <span className="week-label">{DOW_LABELS[i]}</span>
                 </div>
               ))}
