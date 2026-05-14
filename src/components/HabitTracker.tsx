@@ -3,16 +3,59 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
 import {
-  type Habit, type Completion, type Routine, type RoutineCompletion,
-  formatDate, calculateStreak, isTodayComplete, getWeekStatus, getRoutinesForDay,
+  type Routine, type RoutineCompletion,
+  formatDate, getRoutinesForDay,
 } from '@/lib/habitUtils'
-import { Plus, Trash2, LogOut, Check, Loader2, CalendarDays, RefreshCw, Flame, Trophy, Zap, Star, BarChart3, Gift } from 'lucide-react'
+import { Plus, Trash2, LogOut, Check, Loader2, RefreshCw, Flame, Trophy, Zap, Star, BarChart3, Gift, Target, HelpCircle } from 'lucide-react'
 import Heatmap from './Heatmap'
 import RewardVault, { type Reward } from './RewardVault'
 import ReminderSettings from './ReminderSettings'
+import PlanTab, { type Plan, type PlanActivity, type DailyToss, type UserPoints } from './PlanTab'
+import HelpModal from './HelpModal'
+import { type PlanInput } from './PlanSetup'
 
-type Tab = 'today' | 'routines' | 'stats' | 'rewards'
+type Tab = 'plan' | 'routines' | 'stats' | 'rewards'
 interface Props { username: string; onLogout: () => void }
+
+// Compute streak from daily tosses across all plans
+function computeTossStreak(tosses: DailyToss[]): number {
+  if (tosses.length === 0) return 0
+  // Group by date — a day "counts" if ANY toss that day is completed OR a rest day was completed
+  const byDate = new Map<string, { hasActive: boolean; hasCompletedActive: boolean; hasRest: boolean; hasCompletedRest: boolean }>()
+  tosses.forEach(t => {
+    const e = byDate.get(t.toss_date) ?? { hasActive: false, hasCompletedActive: false, hasRest: false, hasCompletedRest: false }
+    if (t.is_rest_day) {
+      e.hasRest = true
+      if (t.completed) e.hasCompletedRest = true
+    } else {
+      e.hasActive = true
+      if (t.completed) e.hasCompletedActive = true
+    }
+    byDate.set(t.toss_date, e)
+  })
+  // Walk backwards from today
+  let streak = 0
+  const cursor = new Date()
+  cursor.setHours(0, 0, 0, 0)
+  for (let i = 0; i < 365; i++) {
+    const key = formatDate(cursor)
+    const e = byDate.get(key)
+    if (!e) {
+      // No toss this day → break (but allow today if no toss yet)
+      if (i === 0) { cursor.setDate(cursor.getDate() - 1); continue }
+      break
+    }
+    // Counts as streak if: completed an active OR it was a rest day (rest day doesn't break streak)
+    if (e.hasCompletedActive || (e.hasRest && !e.hasActive)) {
+      streak++
+    } else {
+      if (i === 0) { cursor.setDate(cursor.getDate() - 1); continue } // today not done yet
+      break
+    }
+    cursor.setDate(cursor.getDate() - 1)
+  }
+  return streak
+}
 
 function getLevel(streak: number) {
   if (streak >= 365) return { level: 10, title: 'Legendary', color: '#b45309', next: Infinity }
@@ -44,22 +87,21 @@ function getMilestone(streak: number): string | null {
 }
 
 export default function HabitTracker({ username, onLogout }: Props) {
-  const [tab, setTab] = useState<Tab>('today')
+  const [tab, setTab] = useState<Tab>('plan')
   const [userId, setUserId] = useState<string | null>(null)
-  const [allHabits, setAllHabits] = useState<Habit[]>([])
-  const [completions, setCompletions] = useState<Completion[]>([])
   const [routines, setRoutines] = useState<Routine[]>([])
   const [routineCompletions, setRoutineCompletions] = useState<RoutineCompletion[]>([])
+  const [plans, setPlans] = useState<Plan[]>([])
+  const [activities, setActivities] = useState<PlanActivity[]>([])
+  const [tosses, setTosses] = useState<DailyToss[]>([])
   const [rewards, setRewards] = useState<Reward[]>([])
+  const [points, setPoints] = useState<UserPoints>({ points: 0, rest_day_credits: 0 })
   const [reminderTime, setReminderTime] = useState('21:00')
   const [reminderEnabled, setReminderEnabled] = useState(false)
   const [loading, setLoading] = useState(true)
-  const [newHabitName, setNewHabitName] = useState('')
-  const [showAdd, setShowAdd] = useState(false)
-  const [adding, setAdding] = useState(false)
   const [toggling, setToggling] = useState<Set<string>>(new Set())
-  const [deleting, setDeleting] = useState<Set<string>>(new Set())
   const [celebration, setCelebration] = useState<string | null>(null)
+  const [showHelp, setShowHelp] = useState(false)
   const prevStreakRef = useRef<number>(0)
 
   const today = formatDate(new Date())
@@ -74,29 +116,40 @@ export default function HabitTracker({ username, onLogout }: Props) {
   }, [username])
 
   const loadData = useCallback(async (uid: string) => {
-    const cutoff = formatDate(new Date(Date.now() - 200 * 86400000))
-    const { data: habits } = await supabase.from('habits').select('*').eq('user_id', uid).order('created_at', { ascending: true })
-    const habitIds = (habits ?? []).map(h => h.id)
-    const { data: comps } = habitIds.length > 0
-      ? await supabase.from('completions').select('habit_id, completed_date').in('habit_id', habitIds).gte('completed_date', cutoff)
-      : { data: [] }
+    // Routines
     const { data: rts } = await supabase.from('routines').select('*').eq('user_id', uid).order('created_at', { ascending: true })
     const routineIds = (rts ?? []).map(r => r.id)
+    const cutoff = formatDate(new Date(Date.now() - 200 * 86400000))
     const { data: rtComps } = routineIds.length > 0
       ? await supabase.from('routine_completions').select('routine_id, completed_date').in('routine_id', routineIds).gte('completed_date', cutoff)
       : { data: [] }
+
+    // Plans + activities + tosses
+    const { data: pls } = await supabase.from('plans').select('*').eq('user_id', uid).is('deleted_at', null).order('created_at', { ascending: true })
+    const planIds = (pls ?? []).map(p => p.id)
+    const { data: acts } = planIds.length > 0
+      ? await supabase.from('plan_activities').select('*').in('plan_id', planIds)
+      : { data: [] }
+    const { data: tss } = planIds.length > 0
+      ? await supabase.from('daily_tosses').select('*').in('plan_id', planIds).gte('toss_date', cutoff)
+      : { data: [] }
+
+    // Rewards + points + settings
     const { data: rwds } = await supabase.from('rewards').select('*').eq('user_id', uid).order('milestone', { ascending: true })
     const { data: settings } = await supabase.from('user_settings').select('*').eq('user_id', uid).maybeSingle()
+    const { data: pts } = await supabase.from('user_points').select('*').eq('user_id', uid).maybeSingle()
 
-    setAllHabits(habits ?? [])
-    setCompletions(comps ?? [])
     setRoutines(rts ?? [])
     setRoutineCompletions(rtComps ?? [])
+    setPlans(pls ?? [])
+    setActivities(acts ?? [])
+    setTosses(tss ?? [])
     setRewards(rwds ?? [])
     if (settings) {
       setReminderTime(settings.reminder_time ?? '21:00')
       setReminderEnabled(settings.reminder_enabled ?? false)
     }
+    if (pts) setPoints({ points: pts.points ?? 0, rest_day_credits: pts.rest_day_credits ?? 0 })
   }, [])
 
   useEffect(() => {
@@ -114,35 +167,25 @@ export default function HabitTracker({ username, onLogout }: Props) {
     return () => { cancelled = true }
   }, [initUser, loadData])
 
-  const activeHabits = allHabits.filter(h => !h.deleted_at)
-  const todayHabitDone = new Set(completions.filter(c => c.completed_date === today).map(c => c.habit_id))
-  const streak = calculateStreak(allHabits, completions)
-  const weekDays = getWeekStatus(allHabits, completions)
   const activeRoutines = routines.filter(r => !r.deleted_at)
   const todayRoutines = getRoutinesForDay(activeRoutines, todayDOW)
   const todayRoutineDone = new Set(routineCompletions.filter(c => c.completed_date === today).map(c => c.routine_id))
-  const totalToday = activeHabits.length + todayRoutines.length
-  const doneToday = activeHabits.filter(h => todayHabitDone.has(h.id)).length + todayRoutines.filter(r => todayRoutineDone.has(r.id)).length
-  const progressPct = totalToday > 0 ? Math.round((doneToday / totalToday) * 100) : 0
+
+  const todayTosses = tosses.filter(t => t.toss_date === today)
+  const recentTosses = tosses // last 200 days already loaded
+  const streak = computeTossStreak(tosses)
   const { level, title: levelTitle, color: levelColor, next: nextLevel } = getLevel(streak)
   const milestoneMsg = getMilestone(streak)
-  const DOW_LABELS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']
-  const todayDOWIdx = new Date().getDay()
 
-  // Compute stats for stats tab
-  const totalCompletions = completions.length + routineCompletions.length
+  // Stats data
+  const totalCompletions = tosses.filter(t => t.completed).length + routineCompletions.length
   const last30Cutoff = new Date(); last30Cutoff.setDate(last30Cutoff.getDate() - 30)
   const last30Key = formatDate(last30Cutoff)
-  const last30Done = completions.filter(c => c.completed_date >= last30Key).length
-  const last30Possible = activeHabits.reduce((acc, h) => {
-    const created = new Date(h.created_at)
-    const start = created > last30Cutoff ? created : last30Cutoff
-    const days = Math.floor((Date.now() - start.getTime()) / 86400000) + 1
-    return acc + Math.max(0, days)
-  }, 0)
-  const last30Rate = last30Possible > 0 ? Math.round((last30Done / last30Possible) * 100) : 0
+  const last30Tosses = tosses.filter(t => t.toss_date >= last30Key)
+  const last30Done = last30Tosses.filter(t => t.completed || (t.is_rest_day && !t.completed)).length
+  const last30Rate = last30Tosses.length > 0 ? Math.round((last30Done / last30Tosses.length) * 100) : 0
 
-  // Check newly unlocked rewards (when streak crosses milestone)
+  // Check newly unlocked rewards
   useEffect(() => {
     if (loading) return
     if (prevStreakRef.current === 0) {
@@ -165,7 +208,6 @@ export default function HabitTracker({ username, onLogout }: Props) {
   useEffect(() => {
     if (!reminderEnabled || typeof window === 'undefined' || !('Notification' in window)) return
     if (Notification.permission !== 'granted') return
-
     const checkInterval = setInterval(() => {
       const now = new Date()
       const [h, m] = reminderTime.split(':').map(Number)
@@ -173,58 +215,23 @@ export default function HabitTracker({ username, onLogout }: Props) {
         const todayKey = formatDate(now)
         const lastNotified = localStorage.getItem('last-reminder-date')
         if (lastNotified === todayKey) return
-        // check if not all complete
-        if (totalToday > 0 && doneToday < totalToday) {
+        const incompletePlans = plans.filter(p => {
+          const t = todayTosses.find(tt => tt.plan_id === p.id)
+          return !t || (!t.is_rest_day && !t.completed)
+        })
+        if (incompletePlans.length > 0) {
           new Notification('🌿 Streak Master', {
-            body: `Don't break your streak! You have ${totalToday - doneToday} habit${totalToday - doneToday === 1 ? '' : 's'} left today.`,
+            body: `Don't break your streak! ${incompletePlans.length} plan${incompletePlans.length === 1 ? '' : 's'} pending today.`,
             icon: '/icon-192.png',
           })
           localStorage.setItem('last-reminder-date', todayKey)
         }
       }
-    }, 30000) // check every 30s
-
+    }, 30000)
     return () => clearInterval(checkInterval)
-  }, [reminderEnabled, reminderTime, doneToday, totalToday])
+  }, [reminderEnabled, reminderTime, plans, todayTosses])
 
-  async function toggleHabit(habitId: string) {
-    if (toggling.has(habitId)) return
-    setToggling(prev => new Set(prev).add(habitId))
-    const isDone = todayHabitDone.has(habitId)
-    if (isDone) {
-      setCompletions(prev => prev.filter(c => !(c.habit_id === habitId && c.completed_date === today)))
-      await supabase.from('completions').delete().eq('habit_id', habitId).eq('completed_date', today)
-    } else {
-      setCompletions(prev => [...prev, { habit_id: habitId, completed_date: today }])
-      await supabase.from('completions').upsert({ habit_id: habitId, completed_date: today })
-      const newDone = doneToday + 1
-      if (newDone === totalToday && totalToday > 0) {
-        setCelebration('✓ Perfect day — all tasks complete!')
-        setTimeout(() => setCelebration(null), 3000)
-      }
-    }
-    setToggling(prev => { const s = new Set(prev); s.delete(habitId); return s })
-  }
-
-  async function addHabit(e: React.FormEvent) {
-    e.preventDefault()
-    const name = newHabitName.trim()
-    if (!name || !userId) return
-    setAdding(true)
-    const { data, error } = await supabase.from('habits').insert({ user_id: userId, name }).select('*').single()
-    if (!error && data) { setAllHabits(prev => [...prev, data]); setNewHabitName(''); setShowAdd(false) }
-    setAdding(false)
-  }
-
-  async function deleteHabit(habitId: string) {
-    if (deleting.has(habitId)) return
-    setDeleting(prev => new Set(prev).add(habitId))
-    const now = new Date().toISOString()
-    setAllHabits(prev => prev.map(h => h.id === habitId ? { ...h, deleted_at: now } : h))
-    await supabase.from('habits').update({ deleted_at: now }).eq('id', habitId)
-    setDeleting(prev => { const s = new Set(prev); s.delete(habitId); return s })
-  }
-
+  // ─── Routine actions ───
   async function toggleRoutine(routineId: string) {
     if (toggling.has(routineId)) return
     setToggling(prev => new Set(prev).add(routineId))
@@ -251,18 +258,93 @@ export default function HabitTracker({ username, onLogout }: Props) {
     await supabase.from('routines').update({ deleted_at: now }).eq('id', routineId)
   }
 
-  async function addReward(milestone: number, title: string) {
+  // ─── Plan actions ───
+  async function addPlan(input: PlanInput) {
     if (!userId) return
-    const { data, error } = await supabase.from('rewards')
-      .insert({ user_id: userId, milestone, title }).select('*').single()
-    if (!error && data) setRewards(prev => [...prev, data])
+    const { data: planRow, error } = await supabase.from('plans').insert({
+      user_id: userId,
+      name: input.name,
+      frequency: input.frequency,
+      custom_days_per_week: input.custom_days_per_week ?? null,
+      rest_days_per_week: input.rest_days_per_week,
+      final_goal: input.final_goal ?? null,
+      session_length: input.session_length,
+    }).select('*').single()
+    if (error || !planRow) return
+    // Insert activities
+    if (input.activities.length > 0) {
+      const { data: actsRows } = await supabase.from('plan_activities').insert(
+        input.activities.map(a => ({
+          plan_id: planRow.id,
+          detail: a.detail,
+          difficulty: a.difficulty,
+          repeatable: a.repeatable,
+        }))
+      ).select('*')
+      if (actsRows) setActivities(prev => [...prev, ...actsRows])
+    }
+    setPlans(prev => [...prev, planRow])
+    setCelebration(`✨ Plan "${input.name}" created!`)
+    setTimeout(() => setCelebration(null), 2500)
   }
 
+  async function deletePlan(planId: string) {
+    setPlans(prev => prev.filter(p => p.id !== planId))
+    await supabase.from('plans').update({ deleted_at: new Date().toISOString() }).eq('id', planId)
+  }
+
+  async function toss(planId: string, activityId: string | null, isRest: boolean) {
+    const { data, error } = await supabase.from('daily_tosses').insert({
+      plan_id: planId,
+      activity_id: activityId,
+      toss_date: today,
+      is_rest_day: isRest,
+    }).select('*').single()
+    if (!error && data) {
+      setTosses(prev => [...prev, data])
+      setCelebration(isRest ? '💤 Rest day! Enjoy.' : '🎲 New activity tossed!')
+      setTimeout(() => setCelebration(null), 2500)
+    }
+  }
+
+  async function completeToss(tossId: string, isRest: boolean) {
+    const now = new Date().toISOString()
+    const reward = isRest ? 20 : 10
+    setTosses(prev => prev.map(t => t.id === tossId ? { ...t, completed: true, completed_at: now } : t))
+    await supabase.from('daily_tosses').update({ completed: true, completed_at: now }).eq('id', tossId)
+    // Add points
+    if (!userId) return
+    const newPoints = points.points + reward
+    setPoints(p => ({ ...p, points: newPoints }))
+    await supabase.from('user_points').upsert({
+      user_id: userId, points: newPoints, rest_day_credits: points.rest_day_credits, updated_at: now,
+    })
+    setCelebration(`+${reward} points! 🎉`)
+    setTimeout(() => setCelebration(null), 2500)
+  }
+
+  async function buyRestDay() {
+    if (points.points < 50 || !userId) return
+    const newPts = { points: points.points - 50, rest_day_credits: points.rest_day_credits + 1 }
+    setPoints(newPts)
+    await supabase.from('user_points').upsert({
+      user_id: userId, points: newPts.points, rest_day_credits: newPts.rest_day_credits,
+      updated_at: new Date().toISOString(),
+    })
+    setCelebration('🛏️ Rest day credit purchased!')
+    setTimeout(() => setCelebration(null), 2500)
+  }
+
+  // ─── Reward actions ───
+  async function addReward(milestone: number, title: string) {
+    if (!userId) return
+    const { data, error } = await supabase.from('rewards').insert({ user_id: userId, milestone, title }).select('*').single()
+    if (!error && data) setRewards(prev => [...prev, data])
+  }
   async function deleteReward(id: string) {
     setRewards(prev => prev.filter(r => r.id !== id))
     await supabase.from('rewards').delete().eq('id', id)
   }
-
   async function claimReward(id: string) {
     const now = new Date().toISOString()
     setRewards(prev => prev.map(r => r.id === id ? { ...r, claimed: true, claimed_at: now } : r))
@@ -272,8 +354,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
   }
 
   async function saveReminderSettings(enabled: boolean, time: string) {
-    setReminderEnabled(enabled)
-    setReminderTime(time)
+    setReminderEnabled(enabled); setReminderTime(time)
     if (!userId) return
     await supabase.from('user_settings').upsert({
       user_id: userId, reminder_enabled: enabled, reminder_time: time,
@@ -292,11 +373,20 @@ export default function HabitTracker({ username, onLogout }: Props) {
     )
   }
 
+  // build heatmap-compatible data from tosses (so the heatmap still works)
+  const heatmapHabits = plans.map(p => ({
+    id: p.id, name: p.name, user_id: '', deleted_at: p.deleted_at ?? null,
+    created_at: new Date(Date.now() - 100 * 86400000).toISOString(),
+  }))
+  const heatmapCompletions = tosses.filter(t => t.completed || (t.is_rest_day && !t.completed))
+    .map(t => ({ habit_id: t.plan_id, completed_date: t.toss_date }))
+
   return (
     <div className="ht-root">
       <style>{htStyles}</style>
 
       {celebration && <div className="celebration-banner">{celebration}</div>}
+      {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
 
       <div className="ht-inner">
 
@@ -308,9 +398,14 @@ export default function HabitTracker({ username, onLogout }: Props) {
               <div className="header-level" style={{ color: levelColor }}>★ Lvl {level} · {levelTitle}</div>
             </div>
           </div>
-          <button onClick={onLogout} className="logout-btn">
-            <LogOut style={{ width: 13, height: 13 }} /> Switch
-          </button>
+          <div style={{ display: 'flex', gap: '0.4rem' }}>
+            <button onClick={() => setShowHelp(true)} className="help-btn" aria-label="Help">
+              <HelpCircle style={{ width: 16, height: 16 }} />
+            </button>
+            <button onClick={onLogout} className="logout-btn">
+              <LogOut style={{ width: 13, height: 13 }} /> Switch
+            </button>
+          </div>
         </div>
 
         <div className="streak-hero">
@@ -323,9 +418,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
               <div className="streak-badge" style={{ background: levelColor + '18', color: levelColor, border: `1px solid ${levelColor}30` }}>
                 ★ {levelTitle}
               </div>
-              {nextLevel !== Infinity && (
-                <div className="streak-next">{nextLevel - streak} days to next level</div>
-              )}
+              {nextLevel !== Infinity && <div className="streak-next">{nextLevel - streak} days to next level</div>}
               {nextLevel !== Infinity && (
                 <div className="level-bar-bg">
                   <div className="level-bar-fill" style={{ width: `${Math.round((streak / nextLevel) * 100)}%`, background: levelColor }} />
@@ -335,19 +428,6 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </div>
 
           {milestoneMsg && <div className="milestone-msg">{milestoneMsg}</div>}
-
-          <div className="week-row">
-            {weekDays.map((day, i) => {
-              const isComplete = day.status === 'complete'
-              const isEmpty = day.status === 'empty' || day.status === 'future'
-              return (
-                <div key={i} className={`week-dot-wrap ${i === todayDOWIdx ? 'week-today' : ''}`}>
-                  <div className={`week-dot ${isComplete ? 'week-dot-done' : isEmpty ? 'week-dot-empty' : 'week-dot-miss'}`} />
-                  <span className="week-label">{DOW_LABELS[i]}</span>
-                </div>
-              )
-            })}
-          </div>
         </div>
 
         <div className="stats-row">
@@ -358,13 +438,13 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </div>
           <div className="stat-card">
             <Trophy style={{ width: 14, height: 14, color: '#92400e' }} />
-            <div className="stat-val">{streak}</div>
-            <div className="stat-key">Best</div>
+            <div className="stat-val">{points.points}</div>
+            <div className="stat-key">Points</div>
           </div>
           <div className="stat-card">
             <Zap style={{ width: 14, height: 14, color: '#2d4a2d' }} />
-            <div className="stat-val">{progressPct}%</div>
-            <div className="stat-key">Today</div>
+            <div className="stat-val">{plans.length}</div>
+            <div className="stat-key">Plans</div>
           </div>
           <div className="stat-card">
             <Star style={{ width: 14, height: 14, color: levelColor }} />
@@ -374,8 +454,8 @@ export default function HabitTracker({ username, onLogout }: Props) {
         </div>
 
         <div className="tab-bar">
-          <button className={`tab-btn ${tab === 'today' ? 'tab-active' : ''}`} onClick={() => setTab('today')}>
-            <CalendarDays style={{ width: 13, height: 13 }} /> Today
+          <button className={`tab-btn ${tab === 'plan' ? 'tab-active' : ''}`} onClick={() => setTab('plan')}>
+            <Target style={{ width: 13, height: 13 }} /> Plan
           </button>
           <button className={`tab-btn ${tab === 'routines' ? 'tab-active' : ''}`} onClick={() => setTab('routines')}>
             <RefreshCw style={{ width: 13, height: 13 }} /> Routines
@@ -388,95 +468,48 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </button>
         </div>
 
-        {tab === 'today' && (
-          <div className="tasks-panel">
-            <div className="progress-header">
-              <div className="progress-info">
-                <span className="progress-title">Today&apos;s progress</span>
-                <span className="progress-count">{doneToday} / {totalToday}</span>
-              </div>
-              <div className="progress-bar-bg">
-                <div className="progress-bar-fill" style={{
-                  width: `${progressPct}%`,
-                  background: progressPct === 100 ? '#2d4a2d' : '#3a6b3a',
-                }} />
-              </div>
-              {progressPct === 100 && totalToday > 0 && (
-                <div className="perfect-badge">✓ Perfect day!</div>
-              )}
-            </div>
-
-            <button className="add-habit-btn" onClick={() => setShowAdd(v => !v)}>
-              <Plus style={{ width: 15, height: 15 }} /> Add habit
-            </button>
-
-            {showAdd && (
-              <form onSubmit={addHabit} className="add-form">
-                <input type="text" value={newHabitName}
-                  onChange={e => setNewHabitName(e.target.value)}
-                  placeholder="New habit name…" autoFocus maxLength={60} className="add-input" />
-                <button type="submit" disabled={adding || !newHabitName.trim()} className="add-save-btn">
-                  {adding ? <Loader2 style={{ width: 14, height: 14 }} className="spin" /> : 'Save'}
-                </button>
-              </form>
-            )}
-
-            {activeHabits.length > 0 && (
-              <div className="task-section">
-                <div className="section-label">Daily habits</div>
-                <div className="task-list">
-                  {activeHabits.map(habit => (
-                    <TaskRow
-                      key={habit.id} label={habit.name}
-                      done={todayHabitDone.has(habit.id)}
-                      toggling={toggling.has(habit.id)}
-                      onToggle={() => toggleHabit(habit.id)}
-                      onDelete={() => deleteHabit(habit.id)}
-                      deleting={deleting.has(habit.id)}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {todayRoutines.length > 0 && (
-              <div className="task-section">
-                <div className="section-label">Today&apos;s routines</div>
-                <div className="task-list">
-                  {todayRoutines.map(routine => (
-                    <TaskRow
-                      key={routine.id} label={routine.name}
-                      done={todayRoutineDone.has(routine.id)}
-                      toggling={toggling.has(routine.id)}
-                      onToggle={() => toggleRoutine(routine.id)}
-                      badge="routine"
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {activeHabits.length === 0 && todayRoutines.length === 0 && (
-              <div className="empty-state">
-                <div style={{ fontSize: '2rem', marginBottom: '0.75rem' }}>🌱</div>
-                <p className="empty-text">No habits yet — add your first one above!</p>
-              </div>
-            )}
-          </div>
+        {tab === 'plan' && (
+          <PlanTab
+            plans={plans}
+            activities={activities}
+            todayTosses={todayTosses}
+            recentTosses={recentTosses}
+            todayDate={today}
+            points={points}
+            onAddPlan={addPlan}
+            onDeletePlan={deletePlan}
+            onToss={toss}
+            onCompleteToss={completeToss}
+            onBuyRestDay={buyRestDay}
+          />
         )}
 
         {tab === 'routines' && (
-          <RoutinesPanel routines={activeRoutines} onAdd={addRoutine} onDelete={deleteRoutine} />
+          <>
+            {todayRoutines.length > 0 && (
+              <div className="tasks-panel">
+                <div className="section-label">Today&apos;s routines</div>
+                <div className="task-list">
+                  {todayRoutines.map(routine => (
+                    <div key={routine.id} className={`task-row ${todayRoutineDone.has(routine.id) ? 'task-done' : ''}`}>
+                      <button onClick={() => toggleRoutine(routine.id)} disabled={toggling.has(routine.id)}
+                        className={`task-check ${todayRoutineDone.has(routine.id) ? 'task-check-done' : ''}`}>
+                        {toggling.has(routine.id)
+                          ? <Loader2 style={{ width: 12, height: 12 }} className="spin" />
+                          : todayRoutineDone.has(routine.id) ? <Check style={{ width: 12, height: 12 }} strokeWidth={3} /> : null}
+                      </button>
+                      <span className={`task-label ${todayRoutineDone.has(routine.id) ? 'task-label-done' : ''}`}>{routine.name}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <RoutinesPanel routines={activeRoutines} onAdd={addRoutine} onDelete={deleteRoutine} />
+          </>
         )}
 
         {tab === 'rewards' && (
-          <RewardVault
-            rewards={rewards}
-            currentStreak={streak}
-            onAdd={addReward}
-            onDelete={deleteReward}
-            onClaim={claimReward}
-          />
+          <RewardVault rewards={rewards} currentStreak={streak} onAdd={addReward} onDelete={deleteReward} onClaim={claimReward} />
         )}
 
         {tab === 'stats' && (
@@ -493,22 +526,16 @@ export default function HabitTracker({ username, onLogout }: Props) {
                   <div className="big-stat-key">Last 30 days</div>
                 </div>
                 <div className="big-stat">
-                  <div className="big-stat-val">{activeHabits.length}</div>
-                  <div className="big-stat-key">Active habits</div>
+                  <div className="big-stat-val">{points.points}</div>
+                  <div className="big-stat-key">Points</div>
                 </div>
               </div>
             </div>
-
             <div className="heatmap-panel">
               <h3 className="stats-panel-title">📅 Activity heatmap</h3>
-              <Heatmap habits={allHabits} completions={completions} />
+              <Heatmap habits={heatmapHabits} completions={heatmapCompletions} />
             </div>
-
-            <ReminderSettings
-              enabled={reminderEnabled}
-              time={reminderTime}
-              onChange={saveReminderSettings}
-            />
+            <ReminderSettings enabled={reminderEnabled} time={reminderTime} onChange={saveReminderSettings} />
           </>
         )}
 
@@ -518,29 +545,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
   )
 }
 
-function TaskRow({ label, done, toggling, onToggle, onDelete, deleting, badge }: {
-  label: string; done: boolean; toggling: boolean; onToggle: () => void;
-  onDelete?: () => void; deleting?: boolean; badge?: string;
-}) {
-  return (
-    <div className={`task-row ${done ? 'task-done' : ''}`}>
-      <button onClick={onToggle} disabled={toggling} className={`task-check ${done ? 'task-check-done' : ''}`}>
-        {toggling
-          ? <Loader2 style={{ width: 12, height: 12 }} className="spin" />
-          : done ? <Check style={{ width: 12, height: 12 }} strokeWidth={3} /> : null}
-      </button>
-      <span className={`task-label ${done ? 'task-label-done' : ''}`}>{label}</span>
-      {badge && <span className="task-badge">{badge}</span>}
-      {done && <span className="task-xp">+XP</span>}
-      {onDelete && (
-        <button onClick={onDelete} disabled={deleting} className="task-delete">
-          {deleting ? <Loader2 style={{ width: 13, height: 13 }} className="spin" /> : <Trash2 style={{ width: 13, height: 13 }} />}
-        </button>
-      )}
-    </div>
-  )
-}
-
+// ─── Routines Panel (kept simple) ───
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 function RoutinesPanel({ routines, onAdd, onDelete }: {
@@ -625,7 +630,7 @@ const htStyles = `
     background: #2d4a2d; color: #e8f0e8;
     padding: 0.625rem 1.25rem; border-radius: 100px;
     font-family: 'Lora', serif; font-weight: 600; font-size: 0.875rem;
-    z-index: 1000; white-space: nowrap; max-width: 90%;
+    z-index: 200; white-space: nowrap; max-width: 90%;
     animation: banner-in 0.3s ease-out, banner-out 0.3s ease-in 3.7s forwards;
     box-shadow: 0 4px 20px rgba(45,74,45,0.25);
   }
@@ -643,15 +648,16 @@ const htStyles = `
   .header-name { font-size: 0.875rem; font-weight: 500; color: #1a2e1a; }
   .header-level { font-size: 0.7rem; margin-top: 1px; font-weight: 500; }
 
-  .logout-btn {
+  .help-btn, .logout-btn {
     display: flex; align-items: center; gap: 0.375rem;
     background: #fff; border: 1px solid #ddd9d0;
-    color: #8a9e8a; padding: 0.4rem 0.75rem;
-    border-radius: 100px; font-size: 0.75rem;
+    color: #8a9e8a; padding: 0.4rem 0.65rem;
+    border-radius: 100px; font-size: 0.72rem;
     cursor: pointer; transition: all 0.2s;
     font-family: 'DM Sans', sans-serif;
   }
-  .logout-btn:hover { color: #1a2e1a; border-color: #b8b4aa; }
+  .help-btn { padding: 0.4rem 0.5rem; }
+  .help-btn:hover, .logout-btn:hover { color: #2d4a2d; border-color: #b8b4aa; }
 
   .streak-hero {
     background: #faf8f4; border: 1px solid #ddd9d0;
@@ -673,16 +679,6 @@ const htStyles = `
     font-size: 0.8rem; color: #3a6b3a; font-weight: 500;
     font-family: 'Lora', serif; font-style: italic;
   }
-
-  .week-row { display: flex; justify-content: space-between; margin-top: 1rem; }
-  .week-dot-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
-  .week-dot { width: 26px; height: 26px; border-radius: 50%; transition: all 0.2s; }
-  .week-dot-done { background: #2d4a2d; }
-  .week-dot-miss { background: #f0ece4; border: 1.5px solid #e5c4c4; }
-  .week-dot-empty { background: #f0ece4; border: 1.5px solid #e0ddd5; }
-  .week-today .week-dot { outline: 2px solid #2d4a2d; outline-offset: 2px; }
-  .week-label { font-size: 0.6rem; color: #9c9688; font-weight: 500; letter-spacing: 0.05em; }
-  .week-today .week-label { color: #2d4a2d; font-weight: 600; }
 
   .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; }
   .stat-card {
@@ -714,34 +710,12 @@ const htStyles = `
     display: flex; flex-direction: column; gap: 0.875rem;
   }
 
-  .stats-panel-title {
-    font-family: 'Lora', serif; font-size: 1rem; font-weight: 700;
-    color: #1a2e1a; margin: 0;
-  }
+  .stats-panel-title { font-family: 'Lora', serif; font-size: 1rem; font-weight: 700; color: #1a2e1a; margin: 0; }
 
   .big-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
-  .big-stat {
-    background: #fff; border: 1px solid #e5e1d8;
-    border-radius: 12px; padding: 0.875rem 0.5rem;
-    display: flex; flex-direction: column; align-items: center;
-  }
-  .big-stat-val {
-    font-family: 'Lora', serif; font-size: 1.5rem;
-    font-weight: 700; color: #2d4a2d;
-  }
-  .big-stat-key {
-    font-size: 0.65rem; color: #9c9688;
-    text-transform: uppercase; letter-spacing: 0.05em;
-    margin-top: 2px; text-align: center;
-  }
-
-  .progress-header { display: flex; flex-direction: column; gap: 0.5rem; }
-  .progress-info { display: flex; justify-content: space-between; align-items: center; }
-  .progress-title { font-size: 0.7rem; color: #9c9688; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
-  .progress-count { font-family: 'Lora', serif; font-size: 0.9rem; font-weight: 700; color: #1a2e1a; }
-  .progress-bar-bg { height: 5px; background: #e5e1d8; border-radius: 99px; overflow: hidden; }
-  .progress-bar-fill { height: 100%; border-radius: 99px; transition: width 0.5s ease; }
-  .perfect-badge { font-size: 0.75rem; color: #2d4a2d; font-weight: 600; font-family: 'Lora', serif; }
+  .big-stat { background: #fff; border: 1px solid #e5e1d8; border-radius: 12px; padding: 0.875rem 0.5rem; display: flex; flex-direction: column; align-items: center; }
+  .big-stat-val { font-family: 'Lora', serif; font-size: 1.5rem; font-weight: 700; color: #2d4a2d; }
+  .big-stat-key { font-size: 0.65rem; color: #9c9688; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; text-align: center; }
 
   .add-habit-btn {
     display: flex; align-items: center; justify-content: center; gap: 6px;
@@ -753,7 +727,6 @@ const htStyles = `
   }
   .add-habit-btn:hover { background: #f0f4ee; border-style: solid; }
 
-  .add-form { display: flex; gap: 0.5rem; }
   .add-input {
     flex: 1; background: #fff; border: 1.5px solid #ddd9d0;
     border-radius: 10px; padding: 0.6rem 0.875rem;
@@ -773,7 +746,6 @@ const htStyles = `
   .add-save-btn:hover:not(:disabled) { background: #3a6b3a; }
   .add-save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  .task-section { display: flex; flex-direction: column; gap: 0.5rem; }
   .section-label { font-size: 0.65rem; font-weight: 600; color: #9c9688; text-transform: uppercase; letter-spacing: 0.1em; }
   .task-list { display: flex; flex-direction: column; gap: 0.4rem; }
 
@@ -784,7 +756,6 @@ const htStyles = `
     border-radius: 12px; transition: all 0.2s;
   }
   .task-done { background: #f0f4ee !important; border-color: #c8d8c8 !important; }
-
   .task-check {
     width: 24px; height: 24px; border-radius: 6px;
     border: 1.5px solid #c8c4ba; background: transparent;
@@ -793,21 +764,9 @@ const htStyles = `
   }
   .task-check:hover:not(:disabled) { border-color: #3a6b3a; background: #f0f4ee; }
   .task-check-done { background: #2d4a2d !important; border-color: #2d4a2d !important; }
-
   .task-label { flex: 1; font-size: 0.9rem; color: #2c3e2c; transition: all 0.2s; }
   .task-label-done { color: #8a9e8a !important; text-decoration: line-through; }
-
-  .task-badge {
-    font-size: 0.65rem; background: #f0f4ee; color: #3a6b3a;
-    padding: 2px 8px; border-radius: 100px; border: 1px solid #c8d8c8; font-weight: 500;
-  }
-  .task-xp { font-size: 0.65rem; color: #3a6b3a; font-weight: 700; font-family: 'Lora', serif; }
-
-  .task-delete {
-    color: #c8c4ba; background: transparent; border: none;
-    cursor: pointer; padding: 3px; border-radius: 5px;
-    display: flex; align-items: center; transition: color 0.15s; flex-shrink: 0;
-  }
+  .task-delete { color: #c8c4ba; background: transparent; border: none; cursor: pointer; padding: 3px; border-radius: 5px; display: flex; align-items: center; transition: color 0.15s; flex-shrink: 0; }
   .task-delete:hover:not(:disabled) { color: #dc2626; }
 
   .routine-form { display: flex; flex-direction: column; gap: 0.625rem; }
@@ -821,17 +780,11 @@ const htStyles = `
   .day-btn:hover { border-color: #3a6b3a; color: #2d4a2d; }
   .day-btn-active { background: #2d4a2d !important; border-color: #2d4a2d !important; color: #e8f0e8 !important; }
 
-  .routine-card {
-    background: #fff; border: 1px solid #e5e1d8;
-    border-radius: 12px; padding: 0.875rem;
-  }
+  .routine-card { background: #fff; border: 1px solid #e5e1d8; border-radius: 12px; padding: 0.875rem; }
   .routine-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem; }
   .routine-name { font-size: 0.9rem; font-weight: 500; color: #2c3e2c; }
   .routine-days { display: flex; gap: 3px; }
-  .routine-day {
-    font-size: 0.65rem; padding: 2px 5px; border-radius: 5px;
-    background: #f5f3ef; color: #9c9688; font-weight: 500;
-  }
+  .routine-day { font-size: 0.65rem; padding: 2px 5px; border-radius: 5px; background: #f5f3ef; color: #9c9688; font-weight: 500; }
   .routine-day-active { background: #2d4a2d !important; color: #e8f0e8 !important; }
 
   .empty-state { text-align: center; padding: 2rem 1rem; }
