@@ -1,14 +1,17 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
 import {
   type Habit, type Completion, type Routine, type RoutineCompletion,
   formatDate, calculateStreak, isTodayComplete, getWeekStatus, getRoutinesForDay,
 } from '@/lib/habitUtils'
-import { Plus, Trash2, LogOut, Check, Loader2, CalendarDays, RefreshCw, Flame, Trophy, Zap, Star } from 'lucide-react'
+import { Plus, Trash2, LogOut, Check, Loader2, CalendarDays, RefreshCw, Flame, Trophy, Zap, Star, BarChart3, Gift } from 'lucide-react'
+import Heatmap from './Heatmap'
+import RewardVault, { type Reward } from './RewardVault'
+import ReminderSettings from './ReminderSettings'
 
-type Tab = 'today' | 'routines'
+type Tab = 'today' | 'routines' | 'stats' | 'rewards'
 interface Props { username: string; onLogout: () => void }
 
 function getLevel(streak: number) {
@@ -47,6 +50,9 @@ export default function HabitTracker({ username, onLogout }: Props) {
   const [completions, setCompletions] = useState<Completion[]>([])
   const [routines, setRoutines] = useState<Routine[]>([])
   const [routineCompletions, setRoutineCompletions] = useState<RoutineCompletion[]>([])
+  const [rewards, setRewards] = useState<Reward[]>([])
+  const [reminderTime, setReminderTime] = useState('21:00')
+  const [reminderEnabled, setReminderEnabled] = useState(false)
   const [loading, setLoading] = useState(true)
   const [newHabitName, setNewHabitName] = useState('')
   const [showAdd, setShowAdd] = useState(false)
@@ -54,6 +60,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
   const [toggling, setToggling] = useState<Set<string>>(new Set())
   const [deleting, setDeleting] = useState<Set<string>>(new Set())
   const [celebration, setCelebration] = useState<string | null>(null)
+  const prevStreakRef = useRef<number>(0)
 
   const today = formatDate(new Date())
   const todayDOW = new Date().getDay()
@@ -67,7 +74,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
   }, [username])
 
   const loadData = useCallback(async (uid: string) => {
-    const cutoff = formatDate(new Date(Date.now() - 60 * 86400000))
+    const cutoff = formatDate(new Date(Date.now() - 200 * 86400000))
     const { data: habits } = await supabase.from('habits').select('*').eq('user_id', uid).order('created_at', { ascending: true })
     const habitIds = (habits ?? []).map(h => h.id)
     const { data: comps } = habitIds.length > 0
@@ -78,10 +85,18 @@ export default function HabitTracker({ username, onLogout }: Props) {
     const { data: rtComps } = routineIds.length > 0
       ? await supabase.from('routine_completions').select('routine_id, completed_date').in('routine_id', routineIds).gte('completed_date', cutoff)
       : { data: [] }
+    const { data: rwds } = await supabase.from('rewards').select('*').eq('user_id', uid).order('milestone', { ascending: true })
+    const { data: settings } = await supabase.from('user_settings').select('*').eq('user_id', uid).maybeSingle()
+
     setAllHabits(habits ?? [])
     setCompletions(comps ?? [])
     setRoutines(rts ?? [])
     setRoutineCompletions(rtComps ?? [])
+    setRewards(rwds ?? [])
+    if (settings) {
+      setReminderTime(settings.reminder_time ?? '21:00')
+      setReminderEnabled(settings.reminder_enabled ?? false)
+    }
   }, [])
 
   useEffect(() => {
@@ -102,7 +117,6 @@ export default function HabitTracker({ username, onLogout }: Props) {
   const activeHabits = allHabits.filter(h => !h.deleted_at)
   const todayHabitDone = new Set(completions.filter(c => c.completed_date === today).map(c => c.habit_id))
   const streak = calculateStreak(allHabits, completions)
-  const todayComplete = isTodayComplete(allHabits, completions)
   const weekDays = getWeekStatus(allHabits, completions)
   const activeRoutines = routines.filter(r => !r.deleted_at)
   const todayRoutines = getRoutinesForDay(activeRoutines, todayDOW)
@@ -114,6 +128,64 @@ export default function HabitTracker({ username, onLogout }: Props) {
   const milestoneMsg = getMilestone(streak)
   const DOW_LABELS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']
   const todayDOWIdx = new Date().getDay()
+
+  // Compute stats for stats tab
+  const totalCompletions = completions.length + routineCompletions.length
+  const last30Cutoff = new Date(); last30Cutoff.setDate(last30Cutoff.getDate() - 30)
+  const last30Key = formatDate(last30Cutoff)
+  const last30Done = completions.filter(c => c.completed_date >= last30Key).length
+  const last30Possible = activeHabits.reduce((acc, h) => {
+    const created = new Date(h.created_at)
+    const start = created > last30Cutoff ? created : last30Cutoff
+    const days = Math.floor((Date.now() - start.getTime()) / 86400000) + 1
+    return acc + Math.max(0, days)
+  }, 0)
+  const last30Rate = last30Possible > 0 ? Math.round((last30Done / last30Possible) * 100) : 0
+
+  // Check newly unlocked rewards (when streak crosses milestone)
+  useEffect(() => {
+    if (loading) return
+    if (prevStreakRef.current === 0) {
+      prevStreakRef.current = streak
+      return
+    }
+    if (streak > prevStreakRef.current) {
+      const newlyUnlocked = rewards.find(r =>
+        !r.claimed && r.milestone > prevStreakRef.current && r.milestone <= streak
+      )
+      if (newlyUnlocked) {
+        setCelebration(`🎁 Reward unlocked: ${newlyUnlocked.title}!`)
+        setTimeout(() => setCelebration(null), 4000)
+      }
+    }
+    prevStreakRef.current = streak
+  }, [streak, rewards, loading])
+
+  // Reminder logic
+  useEffect(() => {
+    if (!reminderEnabled || typeof window === 'undefined' || !('Notification' in window)) return
+    if (Notification.permission !== 'granted') return
+
+    const checkInterval = setInterval(() => {
+      const now = new Date()
+      const [h, m] = reminderTime.split(':').map(Number)
+      if (now.getHours() === h && now.getMinutes() === m) {
+        const todayKey = formatDate(now)
+        const lastNotified = localStorage.getItem('last-reminder-date')
+        if (lastNotified === todayKey) return
+        // check if not all complete
+        if (totalToday > 0 && doneToday < totalToday) {
+          new Notification('🌿 Streak Master', {
+            body: `Don't break your streak! You have ${totalToday - doneToday} habit${totalToday - doneToday === 1 ? '' : 's'} left today.`,
+            icon: '/icon-192.png',
+          })
+          localStorage.setItem('last-reminder-date', todayKey)
+        }
+      }
+    }, 30000) // check every 30s
+
+    return () => clearInterval(checkInterval)
+  }, [reminderEnabled, reminderTime, doneToday, totalToday])
 
   async function toggleHabit(habitId: string) {
     if (toggling.has(habitId)) return
@@ -127,7 +199,7 @@ export default function HabitTracker({ username, onLogout }: Props) {
       await supabase.from('completions').upsert({ habit_id: habitId, completed_date: today })
       const newDone = doneToday + 1
       if (newDone === totalToday && totalToday > 0) {
-        setCelebration('Perfect day — all tasks complete!')
+        setCelebration('✓ Perfect day — all tasks complete!')
         setTimeout(() => setCelebration(null), 3000)
       }
     }
@@ -179,6 +251,35 @@ export default function HabitTracker({ username, onLogout }: Props) {
     await supabase.from('routines').update({ deleted_at: now }).eq('id', routineId)
   }
 
+  async function addReward(milestone: number, title: string) {
+    if (!userId) return
+    const { data, error } = await supabase.from('rewards')
+      .insert({ user_id: userId, milestone, title }).select('*').single()
+    if (!error && data) setRewards(prev => [...prev, data])
+  }
+
+  async function deleteReward(id: string) {
+    setRewards(prev => prev.filter(r => r.id !== id))
+    await supabase.from('rewards').delete().eq('id', id)
+  }
+
+  async function claimReward(id: string) {
+    const now = new Date().toISOString()
+    setRewards(prev => prev.map(r => r.id === id ? { ...r, claimed: true, claimed_at: now } : r))
+    await supabase.from('rewards').update({ claimed: true, claimed_at: now }).eq('id', id)
+    setCelebration('🎉 Reward claimed! Enjoy it!')
+    setTimeout(() => setCelebration(null), 3000)
+  }
+
+  async function saveReminderSettings(enabled: boolean, time: string) {
+    setReminderEnabled(enabled)
+    setReminderTime(time)
+    if (!userId) return
+    await supabase.from('user_settings').upsert({
+      user_id: userId, reminder_enabled: enabled, reminder_time: time,
+    })
+  }
+
   if (loading) {
     return (
       <div className="ht-loading">
@@ -195,11 +296,10 @@ export default function HabitTracker({ username, onLogout }: Props) {
     <div className="ht-root">
       <style>{htStyles}</style>
 
-      {celebration && <div className="celebration-banner">✓ {celebration}</div>}
+      {celebration && <div className="celebration-banner">{celebration}</div>}
 
       <div className="ht-inner">
 
-        {/* HEADER */}
         <div className="ht-header">
           <div className="header-left">
             <span style={{ fontSize: '1.25rem' }}>🌿</span>
@@ -213,7 +313,6 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </button>
         </div>
 
-        {/* STREAK HERO */}
         <div className="streak-hero">
           <div className="streak-top">
             <div>
@@ -237,7 +336,6 @@ export default function HabitTracker({ username, onLogout }: Props) {
 
           {milestoneMsg && <div className="milestone-msg">{milestoneMsg}</div>}
 
-          {/* Week dots */}
           <div className="week-row">
             {weekDays.map((day, i) => {
               const isComplete = day.status === 'complete'
@@ -252,7 +350,6 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </div>
         </div>
 
-        {/* STATS ROW */}
         <div className="stats-row">
           <div className="stat-card">
             <Flame style={{ width: 14, height: 14, color: '#d97706' }} />
@@ -276,17 +373,21 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </div>
         </div>
 
-        {/* TABS */}
         <div className="tab-bar">
           <button className={`tab-btn ${tab === 'today' ? 'tab-active' : ''}`} onClick={() => setTab('today')}>
-            <CalendarDays style={{ width: 14, height: 14 }} /> Daily Tasks
+            <CalendarDays style={{ width: 13, height: 13 }} /> Today
           </button>
           <button className={`tab-btn ${tab === 'routines' ? 'tab-active' : ''}`} onClick={() => setTab('routines')}>
-            <RefreshCw style={{ width: 14, height: 14 }} /> Routines
+            <RefreshCw style={{ width: 13, height: 13 }} /> Routines
+          </button>
+          <button className={`tab-btn ${tab === 'rewards' ? 'tab-active' : ''}`} onClick={() => setTab('rewards')}>
+            <Gift style={{ width: 13, height: 13 }} /> Rewards
+          </button>
+          <button className={`tab-btn ${tab === 'stats' ? 'tab-active' : ''}`} onClick={() => setTab('stats')}>
+            <BarChart3 style={{ width: 13, height: 13 }} /> Stats
           </button>
         </div>
 
-        {/* TODAY TAB */}
         {tab === 'today' && (
           <div className="tasks-panel">
             <div className="progress-header">
@@ -311,12 +412,9 @@ export default function HabitTracker({ username, onLogout }: Props) {
 
             {showAdd && (
               <form onSubmit={addHabit} className="add-form">
-                <input
-                  type="text" value={newHabitName}
+                <input type="text" value={newHabitName}
                   onChange={e => setNewHabitName(e.target.value)}
-                  placeholder="New habit name…"
-                  autoFocus maxLength={60} className="add-input"
-                />
+                  placeholder="New habit name…" autoFocus maxLength={60} className="add-input" />
                 <button type="submit" disabled={adding || !newHabitName.trim()} className="add-save-btn">
                   {adding ? <Loader2 style={{ width: 14, height: 14 }} className="spin" /> : 'Save'}
                 </button>
@@ -367,9 +465,51 @@ export default function HabitTracker({ username, onLogout }: Props) {
           </div>
         )}
 
-        {/* ROUTINES TAB */}
         {tab === 'routines' && (
           <RoutinesPanel routines={activeRoutines} onAdd={addRoutine} onDelete={deleteRoutine} />
+        )}
+
+        {tab === 'rewards' && (
+          <RewardVault
+            rewards={rewards}
+            currentStreak={streak}
+            onAdd={addReward}
+            onDelete={deleteReward}
+            onClaim={claimReward}
+          />
+        )}
+
+        {tab === 'stats' && (
+          <>
+            <div className="stats-panel">
+              <h3 className="stats-panel-title">📊 Your stats</h3>
+              <div className="big-stats">
+                <div className="big-stat">
+                  <div className="big-stat-val">{totalCompletions}</div>
+                  <div className="big-stat-key">Total check-ins</div>
+                </div>
+                <div className="big-stat">
+                  <div className="big-stat-val">{last30Rate}%</div>
+                  <div className="big-stat-key">Last 30 days</div>
+                </div>
+                <div className="big-stat">
+                  <div className="big-stat-val">{activeHabits.length}</div>
+                  <div className="big-stat-key">Active habits</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="heatmap-panel">
+              <h3 className="stats-panel-title">📅 Activity heatmap</h3>
+              <Heatmap habits={allHabits} completions={completions} />
+            </div>
+
+            <ReminderSettings
+              enabled={reminderEnabled}
+              time={reminderTime}
+              onChange={saveReminderSettings}
+            />
+          </>
         )}
 
         <div className="footer-text">Streak Master · synced via @{username}</div>
@@ -411,7 +551,6 @@ function RoutinesPanel({ routines, onAdd, onDelete }: {
   const [days, setDays] = useState<number[]>([])
 
   function toggleDay(d: number) { setDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]) }
-
   function handleAdd(e: React.FormEvent) {
     e.preventDefault()
     if (!name.trim() || days.length === 0) return
@@ -477,10 +616,8 @@ const htStyles = `
   }
 
   .ht-root {
-    min-height: 100vh;
-    background: #edeae2;
-    font-family: 'DM Sans', sans-serif;
-    color: #1a2e1a;
+    min-height: 100vh; background: #edeae2;
+    font-family: 'DM Sans', sans-serif; color: #1a2e1a;
   }
 
   .celebration-banner {
@@ -488,8 +625,8 @@ const htStyles = `
     background: #2d4a2d; color: #e8f0e8;
     padding: 0.625rem 1.25rem; border-radius: 100px;
     font-family: 'Lora', serif; font-weight: 600; font-size: 0.875rem;
-    z-index: 1000; white-space: nowrap;
-    animation: banner-in 0.3s ease-out, banner-out 0.3s ease-in 2.7s forwards;
+    z-index: 1000; white-space: nowrap; max-width: 90%;
+    animation: banner-in 0.3s ease-out, banner-out 0.3s ease-in 3.7s forwards;
     box-shadow: 0 4px 20px rgba(45,74,45,0.25);
   }
   @keyframes banner-in { from { opacity:0; transform:translateX(-50%) translateY(-12px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
@@ -501,10 +638,7 @@ const htStyles = `
     display: flex; flex-direction: column; gap: 0.75rem;
   }
 
-  .ht-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 0.5rem 0;
-  }
+  .ht-header { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0; }
   .header-left { display: flex; align-items: center; gap: 0.625rem; }
   .header-name { font-size: 0.875rem; font-weight: 500; color: #1a2e1a; }
   .header-level { font-size: 0.7rem; margin-top: 1px; font-weight: 500; }
@@ -523,25 +657,12 @@ const htStyles = `
     background: #faf8f4; border: 1px solid #ddd9d0;
     border-radius: 20px; padding: 1.5rem;
   }
-
   .streak-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
-
-  .streak-number {
-    font-family: 'Lora', serif;
-    font-size: 4.5rem; font-weight: 700; line-height: 1;
-    color: #1a2e1a;
-  }
+  .streak-number { font-family: 'Lora', serif; font-size: 4.5rem; font-weight: 700; line-height: 1; color: #1a2e1a; }
   .streak-label { font-size: 0.7rem; color: #9c9688; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 500; margin-top: 4px; }
-
   .streak-right { flex: 1; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; padding-top: 6px; }
-
-  .streak-badge {
-    font-size: 0.7rem; font-weight: 600;
-    padding: 3px 10px; border-radius: 100px; letter-spacing: 0.04em;
-  }
-
+  .streak-badge { font-size: 0.7rem; font-weight: 600; padding: 3px 10px; border-radius: 100px; letter-spacing: 0.04em; }
   .streak-next { font-size: 0.65rem; color: #9c9688; }
-
   .level-bar-bg { width: 100%; height: 4px; background: #e5e1d8; border-radius: 99px; overflow: hidden; }
   .level-bar-fill { height: 100%; border-radius: 99px; transition: width 0.8s ease; }
 
@@ -573,23 +694,45 @@ const htStyles = `
   .stat-key { font-size: 0.6rem; color: #9c9688; text-transform: uppercase; letter-spacing: 0.06em; }
 
   .tab-bar {
-    display: flex; background: #faf8f4;
-    border: 1px solid #ddd9d0; border-radius: 12px; padding: 3px; gap: 3px;
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    background: #faf8f4; border: 1px solid #ddd9d0;
+    border-radius: 12px; padding: 3px; gap: 3px;
   }
   .tab-btn {
-    flex: 1; display: flex; align-items: center; justify-content: center; gap: 5px;
-    padding: 0.55rem; border-radius: 9px; border: none;
+    display: flex; align-items: center; justify-content: center; gap: 4px;
+    padding: 0.5rem 0.25rem; border-radius: 9px; border: none;
     background: transparent; color: #9c9688;
-    font-family: 'DM Sans', sans-serif; font-size: 0.8rem; font-weight: 500;
-    cursor: pointer; transition: all 0.15s;
+    font-family: 'DM Sans', sans-serif; font-size: 0.72rem; font-weight: 500;
+    cursor: pointer; transition: all 0.15s; white-space: nowrap;
   }
   .tab-btn:hover { color: #2d4a2d; }
   .tab-active { background: #2d4a2d !important; color: #e8f0e8 !important; }
 
-  .tasks-panel {
+  .tasks-panel, .stats-panel, .heatmap-panel {
     background: #faf8f4; border: 1px solid #ddd9d0;
     border-radius: 20px; padding: 1.25rem;
     display: flex; flex-direction: column; gap: 0.875rem;
+  }
+
+  .stats-panel-title {
+    font-family: 'Lora', serif; font-size: 1rem; font-weight: 700;
+    color: #1a2e1a; margin: 0;
+  }
+
+  .big-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
+  .big-stat {
+    background: #fff; border: 1px solid #e5e1d8;
+    border-radius: 12px; padding: 0.875rem 0.5rem;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  .big-stat-val {
+    font-family: 'Lora', serif; font-size: 1.5rem;
+    font-weight: 700; color: #2d4a2d;
+  }
+  .big-stat-key {
+    font-size: 0.65rem; color: #9c9688;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    margin-top: 2px; text-align: center;
   }
 
   .progress-header { display: flex; flex-direction: column; gap: 0.5rem; }
@@ -658,11 +801,7 @@ const htStyles = `
     font-size: 0.65rem; background: #f0f4ee; color: #3a6b3a;
     padding: 2px 8px; border-radius: 100px; border: 1px solid #c8d8c8; font-weight: 500;
   }
-
-  .task-xp {
-    font-size: 0.65rem; color: #3a6b3a; font-weight: 700;
-    font-family: 'Lora', serif;
-  }
+  .task-xp { font-size: 0.65rem; color: #3a6b3a; font-weight: 700; font-family: 'Lora', serif; }
 
   .task-delete {
     color: #c8c4ba; background: transparent; border: none;
